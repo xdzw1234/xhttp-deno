@@ -442,7 +442,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   if (path === `/${SUB_PATH}`) {
-    const vlessURL = `vless://${UUID}@${IP}:443?encryption=none&security=tls&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
+    const vlessURL = `vless://${UUID}@${IP}:2096?encryption=none&security=tls&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
     const base64Content = btoa(vlessURL);
     return new Response(base64Content + "\n", {
       status: 200,
