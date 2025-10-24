@@ -1,11 +1,30 @@
-import { serve } from "https://deno.land/std/http/server.ts";
+// deno.ts - Deno Deploy friendly version
+// 说明：已移除 Deno.run 和直接监听端口的写法，改用 Deno.serve。
+// 注意：Deno Deploy 不允许原始 TCP socket（Deno.connect）权限，
+// 所以完整的 VLESS 转发在 Deploy 上会失败并返回 5xx（此文件做了容错处理）。
+
+// 没有从 std 导入 serve，使用内置 Deno.serve
+// import { serve } from "https://deno.land/std/http/server.ts";
+
+interface Settings {
+  UUID: string;
+  LOG_LEVEL?: string;
+  BUFFER_SIZE?: number;
+  XPATH?: string;
+  MAX_BUFFERED_POSTS?: number;
+  MAX_POST_SIZE?: number;
+  SESSION_TIMEOUT?: number;
+  CHUNK_SIZE?: number;
+  TCP_NODELAY?: boolean;
+  TCP_KEEPALIVE?: boolean;
+}
 
 const UUID: string = Deno.env.get("UUID") || "b70a3a2f-5eae-4311-ad37-29a30536e59b";
-const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  //获取订阅路径
+const SUB_PATH: string = Deno.env.get("SUB_PATH") || "sub";  //订阅路径
 const XPATH: string = Deno.env.get("XPATH") || "xhttp";      // 节点路径
-const DOMAIN: string = Deno.env.get("DOMAIN") || "";         // deno分配的域名必填，不带https://前缀，例如：xxxx.deno.dev      
-const NAME: string = Deno.env.get("NAME") || "Deno";         // 名称
-const PORT: number = parseInt(Deno.env.get("PORT") || "3000"); 
+const DOMAIN: string = Deno.env.get("DOMAIN") || "";         // 可留空，Deploy 会分配域名
+const NAME: string = Deno.env.get("NAME") || "Deno";
+const PORT: number = parseInt(Deno.env.get("PORT") || "3000"); // 在 Deploy 上不使用
 
 const SETTINGS: Settings = {
   UUID,
@@ -147,12 +166,13 @@ async function parse_header(
   }
 }
 
+// Attempt to connect remote - may fail on Deploy due to PermissionDenied
 async function connect_remote(hostname: string, port: number): Promise<Deno.Conn> {
-  const timeout = 8000;
   try {
     const conn = await Deno.connect({ hostname, port });
     return conn;
   } catch (err) {
+    // rethrow so caller can handle; on Deploy this will commonly be PermissionDenied
     throw err;
   }
 }
@@ -177,6 +197,7 @@ function pipe_relay() {
         signal: AbortSignal.timeout(SETTINGS.SESSION_TIMEOUT),
       });
     } catch (err) {
+      // propagate up
       throw err;
     }
   }
@@ -258,10 +279,21 @@ class Session {
       };
 
       this.vlessHeader = await parse_header(SETTINGS.UUID, client);
-      this.remote = await connect_remote(this.vlessHeader.hostname, this.vlessHeader.port);
+
+      // 尝试建立远程 TCP 连接（在 Deploy 上通常会被拒绝）
+      try {
+        this.remote = await connect_remote(this.vlessHeader.hostname, this.vlessHeader.port);
+      } catch (err) {
+        // 在 Deploy 上通常会进入这里（PermissionDenied）
+        // 返回 false 表示初始化失败，调用者将进行清理
+        console.warn("connect_remote failed:", err?.message ?? err);
+        return false;
+      }
+
       this.initialized = true;
       return true;
     } catch (err) {
+      console.warn("initializeVLESS error:", err?.message ?? err);
       return false;
     }
   }
@@ -276,7 +308,7 @@ class Session {
 
         if (!this.initialized && this.nextSeq === 0) {
           if (!await this.initializeVLESS(nextData)) {
-            throw new Error("Failed to initialize VLESS connection");
+            throw new Error("Failed to initialize VLESS connection (likely no raw TCP permission).");
           }
           this.responseHeader = this.vlessHeader.resp;
           await this._writeToRemote(this.vlessHeader.data);
@@ -286,6 +318,7 @@ class Session {
           }
         } else {
           if (!this.initialized) {
+            // Not initialized yet (waiting for connection) -> skip processing until initialized
             continue;
           }
           await this._writeToRemote(nextData);
@@ -294,7 +327,7 @@ class Session {
         this.nextSeq++;
       }
 
-      if (this.pendingBuffers.size > SETTINGS.MAX_BUFFERED_POSTS) {
+      if (this.pendingBuffers.size > SETTINGS.MAX_BUFFERED_POSTS!) {
         throw new Error("Too many buffered packets");
       }
 
@@ -330,7 +363,9 @@ class Session {
       this.headerSent = true;
       writer.releaseLock();
 
+      // pipe remote -> client; if remote is null, this will not be called
       this.remote!.readable.pipeTo(this.currentStreamRes.writable).catch((err) => {
+        console.warn("pipeTo error:", err?.message ?? err);
       });
     } catch (err) {
       this.cleanup();
@@ -341,7 +376,7 @@ class Session {
     if (!this.cleaned) {
       this.cleaned = true;
       if (this.remote) {
-        this.remote.close();
+        try { this.remote.close(); } catch (e) {}
         this.remote = null;
       }
       this.initialized = false;
@@ -350,15 +385,15 @@ class Session {
   }
 }
 
+// 获取 ISP 信息（可用 fetch）
 let ISP = "";
-
 try {
   const response = await fetch("https://speed.cloudflare.com/meta");
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
   const data = await response.json() as {
-    country: string; 
+    country: string;
     asOrganization: string;
   };
   ISP = `${data.country}-${data.asOrganization}`.replace(/ /g, "_");
@@ -366,26 +401,18 @@ try {
   ISP = "unknown";
 }
 
-let IP = DOMAIN;
-if (!DOMAIN) {
+// 获取 IP（不使用 Deno.run）
+let IP = DOMAIN || "";
+if (!IP) {
   try {
-    const p = Deno.run({
-      cmd: ["curl", "-s", "--max-time", "2", "ipv4.ip.sb"],
-      stdout: "piped",
-    });
-    const output = await p.output();
-    IP = new TextDecoder().decode(output).trim();
-  } catch (err) {
-    try {
-      const p = Deno.run({
-        cmd: ["curl", "-s", "--max-time", "1", "ipv6.ip.sb"],
-        stdout: "piped",
-      });
-      const output = await p.output();
-      IP = `[${new TextDecoder().decode(output).trim()}]`;
-    } catch (ipv6Err) {
+    const resp = await fetch("https://api.ipify.org?format=text");
+    if (resp.ok) {
+      IP = (await resp.text()).trim();
+    } else {
       IP = "localhost";
     }
+  } catch {
+    IP = "localhost";
   }
 }
 
@@ -394,93 +421,107 @@ function generatePadding(min: number, max: number): string {
   return btoa(Array(length).fill("X").join(""));
 }
 
-serve(
-  async (req: Request): Promise<Response> => {
-    const url = new URL(req.url);
-    const path = url.pathname;
+// 使用 Deno.serve（Deploy 要求），并返回 Response
+Deno.serve(async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
+  const path = url.pathname;
 
-    const headers = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST",
-      "Cache-Control": "no-store",
-      "X-Accel-Buffering": "no",
-      "X-Padding": generatePadding(100, 1000),
-    };
+  const headers = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST",
+    "Cache-Control": "no-store",
+    "X-Accel-Buffering": "no",
+    "X-Padding": generatePadding(100, 1000),
+  };
 
-    if (path === "/") { 
-      return new Response("Hello, World\n", 
-      { status: 200, 
-        headers: { "Content-Type": "text/plain" }, }); 
-    } 
+  if (path === "/") {
+    return new Response("Hello, World\n", {
+      status: 200,
+      headers: { ...headers, "Content-Type": "text/plain" },
+    });
+  }
 
-    if (path === `/${SUB_PATH}`) {
-      const vlessURL = `vless://${UUID}@${IP}:443?encryption=none&security=tls&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
-      const base64Content = btoa(vlessURL);
-      return new Response(base64Content + "\n", {
-        status: 200,
-        headers: { "Content-Type": "text/plain" },
-      });
+  if (path === `/${SUB_PATH}`) {
+    const vlessURL = `vless://${UUID}@${IP}:443?encryption=none&security=tls&sni=${IP}&fp=chrome&allowInsecure=1&type=xhttp&host=${IP}&path=${SETTINGS.XPATH}&mode=packet-up#${NAME}-${ISP}`;
+    const base64Content = btoa(vlessURL);
+    return new Response(base64Content + "\n", {
+      status: 200,
+      headers: { ...headers, "Content-Type": "text/plain" },
+    });
+  }
+
+  const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
+  if (!pathMatch) {
+    return new Response("Not Found", { status: 404, headers });
+  }
+
+  const uuid = pathMatch[1];
+  const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
+
+  // GET downstream (client pull data)
+  if (req.method === "GET" && !seq) {
+    let session = sessions.get(uuid);
+    if (!session) {
+      session = new Session(uuid);
+      sessions.set(uuid, session);
     }
 
-    const pathMatch = path.match(new RegExp(`/${XPATH}/([^/]+)(?:/([0-9]+))?$`));
-    if (!pathMatch) {
-      return new Response("Not Found", { status: 404 });
+    session.downstreamStarted = true;
+    const { readable, writable } = new TransformStream();
+    session.startDownstream({ writable });
+
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        ...headers,
+        "Content-Type": "application/octet-stream",
+        "Transfer-Encoding": "chunked",
+      },
+    });
+  }
+
+  // POST upstream (client push data)
+  if (req.method === "POST" && seq !== null) {
+    let session = sessions.get(uuid);
+    if (!session) {
+      session = new Session(uuid);
+      sessions.set(uuid, session);
+
+      // 如果 downstream 没在短时间内启动，cleanup
+      setTimeout(() => {
+        const currentSession = sessions.get(uuid);
+        if (currentSession && !currentSession.downstreamStarted) {
+          currentSession.cleanup();
+          sessions.delete(uuid);
+        }
+      }, SETTINGS.SESSION_TIMEOUT);
     }
 
-    const uuid = pathMatch[1];
-    const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
+    const data = await req.arrayBuffer();
+    const buffer = new Uint8Array(data);
 
-    if (req.method === "GET" && !seq) {
-      let session = sessions.get(uuid);
-      if (!session) {
-        session = new Session(uuid);
-        sessions.set(uuid, session);
+    try {
+      await session.processPacket(seq, buffer);
+      return new Response(null, { status: 200, headers });
+    } catch (err) {
+      // 如果是因为 Deploy 不允许原始 TCP 导致无法建立远程连接，
+      // 在这里返回 501，提示“平台不支持代理功能”。
+      const msg = (err && (err.message || err.toString())) || "internal error";
+      console.warn("processPacket error:", msg);
+      // 清理会话
+      session.cleanup();
+      sessions.delete(uuid);
+
+      // 如果是权限/连接失败，返回 501 表示平台限制导致功能不可用
+      if (String(msg).toLowerCase().includes("permissiondenied") ||
+          String(msg).toLowerCase().includes("no raw") ||
+          String(msg).toLowerCase().includes("failed to initialize")) {
+        return new Response("Platform does not allow raw TCP connections; proxy not available here.\n", { status: 501, headers });
       }
 
-      session.downstreamStarted = true;
-      const { readable, writable } = new TransformStream();
-      session.startDownstream({ writable });
-
-      return new Response(readable, {
-        status: 200,
-        headers: {
-          ...headers,
-          "Content-Type": "application/octet-stream",
-          "Transfer-Encoding": "chunked",
-        },
-      });
+      return new Response("Internal Server Error\n", { status: 500, headers });
     }
+  }
 
-    if (req.method === "POST" && seq !== null) {
-      let session = sessions.get(uuid);
-      if (!session) {
-        session = new Session(uuid);
-        sessions.set(uuid, session);
-
-        setTimeout(() => {
-          const currentSession = sessions.get(uuid);
-          if (currentSession && !currentSession.downstreamStarted) {
-            currentSession.cleanup();
-            sessions.delete(uuid);
-          }
-        }, SETTINGS.SESSION_TIMEOUT);
-      }
-
-      const data = await req.arrayBuffer();
-      const buffer = new Uint8Array(data);
-
-      try {
-        await session.processPacket(seq, buffer);
-        return new Response(null, { status: 200, headers });
-      } catch (err) {
-        session.cleanup();
-        sessions.delete(uuid);
-        return new Response(null, { status: 500 });
-      }
-    }
-    return new Response("Not Found", { status: 404 });
-  },
-  { port: PORT, onListen: () => {
-    console.log(`Server is running on port ${PORT}`);
-  } }
-);
+  return new Response("Not Found", { status: 404, headers });
+});
